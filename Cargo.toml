@@ -1,15 +1,24 @@
 [package]
 name = "async-ringbuffer"
-version = "0.5.5"
-authors = ["AljoschaMeyer <mail@aljoscha-meyer.de>"]
+version = "0.6.0"
+authors = [
+    "AljoschaMeyer <mail@aljoscha-meyer.de>",
+    "Alessandro Chitolina <alekitto@gmail.com>"
+]
 description = "A nonblocking spsc ring buffer with fixed capacity."
 readme = "README.md"
 license = "LGPL-3.0"
 repository = "https://github.com/sunrise-choir/async-ringbuffer"
-edition = "2018"
+edition = "2021"
+
+[features]
+default = []
+tokio = ["dep:tokio"]
 
 [dependencies]
+futures = "0.3.1"
 futures-io = "0.3.1"
 
-[dev-dependencies]
-futures = "0.3.1"
+[dependencies.tokio]
+version = "1"
+optional = true

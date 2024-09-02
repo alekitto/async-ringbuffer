@@ -1,5 +1,7 @@
-use crate::{ring_buffer, Reader, Writer};
+use crate::ring_buffer;
 
+use crate::reader::Reader;
+use crate::writer::Writer;
 use core::pin::Pin;
 use core::task::Context;
 use futures_io::{AsyncRead, AsyncWrite, Result};
@@ -81,8 +83,8 @@ mod tests {
             assert_eq!(&buf, &[1, 2, 3]);
 
             client.write(&[3, 2, 1]).await.unwrap();
-	    sr.read(&mut buf).await.unwrap();
-	    assert_eq!(&buf, &[3, 2, 1]);
+            sr.read(&mut buf).await.unwrap();
+            assert_eq!(&buf, &[3, 2, 1]);
         });
     }
 }
