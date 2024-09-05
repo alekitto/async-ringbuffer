@@ -29,7 +29,9 @@ impl Writer {
 
 impl Drop for Writer {
     fn drop(&mut self) {
-        self.0.lock().unwrap().wake();
+        let mut lock = self.0.lock().unwrap();
+        lock.did_shutdown = true;
+        lock.wake();
     }
 }
 

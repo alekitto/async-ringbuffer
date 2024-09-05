@@ -60,7 +60,7 @@ impl AsyncRead for Reader {
         let end = unsafe { start.add(capacity) }; // end itself is 1 byte outside the buffer
 
         if rb.amount == 0 {
-            if Arc::strong_count(&self.0) == 1 || rb.did_shutdown {
+            if rb.did_shutdown {
                 return Ready(Ok(0));
             } else {
                 rb.park(cx.waker());
