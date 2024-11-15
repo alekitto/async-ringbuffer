@@ -4,7 +4,6 @@ use std::cmp::min;
 use std::intrinsics::copy_nonoverlapping;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 use std::task::Poll::{Pending, Ready};
 use std::task::{Context, Poll};
@@ -31,7 +30,7 @@ impl Reader {
 
 impl Drop for Reader {
     fn drop(&mut self) {
-        self.0.lock().unwrap().wake();
+        self.0.lock().unwrap().wake_writer();
     }
 }
 
@@ -55,28 +54,39 @@ impl AsyncRead for Reader {
             return Ready(Ok(0));
         }
 
-        let capacity = rb.data.capacity();
-        let start = rb.data.as_mut_slice().as_mut_ptr();
-        let end = unsafe { start.add(capacity) }; // end itself is 1 byte outside the buffer
+        let read_ptr = unsafe { rb.read_ptr() };
+        let write_ptr = unsafe { rb.write_ptr() };
 
-        if rb.amount == 0 {
-            if rb.did_shutdown {
-                return Ready(Ok(0));
+        if read_ptr == write_ptr && rb.count == 0 {
+            return if rb.did_shutdown {
+                Ready(Ok(0))
             } else {
-                rb.park(cx.waker());
-                return Pending;
-            }
+                rb.park_reader(cx.waker());
+                Pending
+            };
         }
 
+        let start = rb.data.as_ptr();
+        let end = unsafe { start.add(rb.size) }; // end itself is 1 byte outside the buffer
+
         let buf_ptr = buf.as_mut_ptr();
-        let read_total = min(buf.len(), rb.amount);
+        let read_total = min(
+            buf.len(),
+            if write_ptr > read_ptr {
+                unsafe { write_ptr.sub(read_ptr as usize) as usize }
+            } else {
+                unsafe {
+                    let remaining = end.sub(read_ptr as usize) as usize;
+                    remaining + write_ptr.sub(start as usize) as usize
+                }
+            },
+        );
 
         if (unsafe { rb.read_ptr().add(read_total) } as *const u8) < end {
             // non-wrapping case
             unsafe { copy_nonoverlapping(rb.read_ptr(), buf_ptr, read_total) };
 
-            rb.read_offset.fetch_add(read_total, Ordering::SeqCst);
-            rb.amount -= read_total;
+            rb.read_offset += read_total;
         } else {
             // wrapping case
             let distance_re = crate::offset_from(end, unsafe { rb.read_ptr() }) as usize;
@@ -85,15 +95,15 @@ impl AsyncRead for Reader {
             unsafe { copy_nonoverlapping(rb.read_ptr(), buf_ptr, distance_re) };
             unsafe { copy_nonoverlapping(start, buf_ptr.add(distance_re), remaining) };
 
-            rb.read_offset.store(remaining, Ordering::SeqCst);
-            rb.amount -= read_total;
+            rb.read_offset = remaining;
         }
 
-        debug_assert!(unsafe { rb.read_ptr() } >= start);
-        debug_assert!(unsafe { rb.read_ptr() } < end);
-        debug_assert!(rb.amount <= capacity);
+        rb.count -= read_total;
 
-        rb.wake();
+        debug_assert!(unsafe { rb.read_ptr() } as usize >= start as usize);
+        debug_assert!((unsafe { rb.read_ptr() } as usize) < end as usize);
+
+        rb.wake_writer();
         Ready(Ok(read_total))
     }
 }

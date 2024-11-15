@@ -1,6 +1,5 @@
 use crate::RingBuffer;
 use futures_io::AsyncWrite;
-use std::cmp::min;
 use std::intrinsics::copy_nonoverlapping;
 use std::io;
 use std::pin::Pin;
@@ -31,7 +30,7 @@ impl Drop for Writer {
     fn drop(&mut self) {
         let mut lock = self.0.lock().unwrap();
         lock.did_shutdown = true;
-        lock.wake();
+        lock.wake_reader();
     }
 }
 
@@ -51,43 +50,51 @@ impl AsyncWrite for Writer {
             return Ready(Ok(0));
         }
 
-        let capacity = rb.data.capacity();
-        let start = rb.data.as_mut_slice().as_mut_ptr();
-        let end = unsafe { start.add(capacity) }; // end itself is 1 byte outside the buffer
+        let read_ptr = unsafe { rb.read_ptr() };
+        let write_ptr = unsafe { rb.write_ptr() };
 
-        if rb.amount == capacity {
-            if Arc::strong_count(&self.0) == 1 {
-                return Ready(Ok(0));
+        if read_ptr == write_ptr && rb.count == rb.size {
+            return if Arc::strong_count(&self.0) == 1 {
+                Ready(Ok(0))
             } else {
-                rb.park(cx.waker());
-                return Pending;
-            }
+                rb.park_writer(cx.waker());
+                Pending
+            };
         }
 
-        let buf_ptr = buf.as_ptr();
-        let write_total = min(buf.len(), capacity - rb.amount);
+        let start = rb.data.as_ptr() as usize;
+        let end = start + rb.size; // end itself is 1 byte outside the buffer
 
-        if (unsafe { rb.write_ptr().add(write_total) } as *const u8) < end {
+        let buf_ptr = buf.as_ptr();
+        let mut write_total = buf.len();
+
+        if (unsafe { rb.write_ptr().add(write_total) } as usize) < end {
             // non-wrapping case
             unsafe { copy_nonoverlapping(buf_ptr, rb.write_ptr(), write_total) };
 
-            rb.amount += write_total;
+            rb.write_offset += write_total;
         } else {
             // wrapping case
-            let distance_we = crate::offset_from(end, rb.write_ptr()) as usize;
-            let remaining: usize = write_total - distance_we;
-
+            let distance_we = end - (write_ptr as usize);
             unsafe { copy_nonoverlapping(buf_ptr, rb.write_ptr(), distance_we) };
-            unsafe { copy_nonoverlapping(buf_ptr.add(distance_we), start, remaining) };
 
-            rb.amount += write_total;
+            let mut remaining: usize = write_total - distance_we;
+            if (start + remaining) > read_ptr as usize {
+                remaining -= (start + remaining) - read_ptr as usize;
+            }
+
+            unsafe { copy_nonoverlapping(buf_ptr, start as *mut u8, remaining) };
+
+            write_total = distance_we + remaining;
+            rb.write_offset = remaining;
         }
 
-        debug_assert!(unsafe { rb.read_ptr() } >= start);
-        debug_assert!(unsafe { rb.read_ptr() } < end);
-        debug_assert!(rb.amount <= capacity);
+        rb.count += write_total;
 
-        rb.wake();
+        debug_assert!(unsafe { rb.write_ptr() } as usize >= start);
+        debug_assert!((unsafe { rb.write_ptr() } as usize) < end);
+
+        rb.wake_reader();
         Ready(Ok(write_total))
     }
 
@@ -106,7 +113,7 @@ impl AsyncWrite for Writer {
         let mut rb = self.0.lock().unwrap();
 
         if !rb.did_shutdown {
-            rb.wake(); // only unpark on first call, makes this method idempotent
+            rb.wake_reader(); // only unpark on first call, makes this method idempotent
         }
         rb.did_shutdown = true;
 

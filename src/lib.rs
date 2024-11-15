@@ -7,7 +7,6 @@ extern crate futures_io;
 #[cfg(test)]
 extern crate futures;
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::Waker;
 
@@ -29,12 +28,15 @@ pub fn ring_buffer(capacity: usize) -> (Writer, Reader) {
         panic!("Invalid ring buffer capacity.");
     }
 
-    let data: Vec<u8> = Vec::with_capacity(capacity);
+    let data = vec![0; capacity].into_boxed_slice();
     let rb = Arc::new(Mutex::new(RingBuffer {
         data,
-        read_offset: AtomicUsize::new(0),
-        amount: 0,
-        waker: None,
+        size: capacity,
+        count: 0,
+        read_offset: 0,
+        write_offset: 0,
+        read_waker: None,
+        write_waker: None,
         did_shutdown: false,
     }));
 
@@ -42,12 +44,14 @@ pub fn ring_buffer(capacity: usize) -> (Writer, Reader) {
 }
 
 struct RingBuffer {
-    data: Vec<u8>,
+    data: Box<[u8]>,
+    size: usize,
+    count: usize,
     // reading resumes from this position, this always points into the buffer
-    read_offset: AtomicUsize,
-    // amount of valid data
-    amount: usize,
-    waker: Option<Waker>,
+    read_offset: usize,
+    write_offset: usize,
+    read_waker: Option<Waker>,
+    write_waker: Option<Waker>,
     did_shutdown: bool,
 }
 
@@ -55,44 +59,38 @@ fn offset_from<T>(x: *const T, other: *const T) -> isize
 where
     T: Sized,
 {
-    let size = std::mem::size_of::<T>();
-    assert!(size != 0);
+    let size = size_of::<T>();
+    assert_ne!(size, 0);
     let diff = (x as isize).wrapping_sub(other as isize);
     diff / size as isize
 }
 
 impl RingBuffer {
-    unsafe fn read_ptr(&mut self) -> *mut u8 {
-        self.data
-            .as_mut_slice()
-            .as_mut_ptr()
-            .add(self.read_offset.load(Ordering::SeqCst))
+    fn park_reader(&mut self, waker: &Waker) {
+        self.read_waker = Some(waker.clone());
+    }
+    fn park_writer(&mut self, waker: &Waker) {
+        self.write_waker = Some(waker.clone());
     }
 
-    fn park(&mut self, waker: &Waker) {
-        self.waker = Some(waker.clone());
-    }
-
-    fn wake(&mut self) {
-        if let Some(w) = self.waker.take() {
+    fn wake_reader(&mut self) {
+        if let Some(w) = self.read_waker.take() {
             w.wake()
         }
     }
 
-    fn write_ptr(&mut self) -> *mut u8 {
-        unsafe {
-            let start = self.data.as_mut_slice().as_mut_ptr();
-            let diff = offset_from(
-                self.read_ptr().add(self.amount),
-                start.add(self.data.capacity()),
-            );
-
-            if diff < 0 {
-                self.read_ptr().add(self.amount)
-            } else {
-                start.offset(diff)
-            }
+    fn wake_writer(&mut self) {
+        if let Some(w) = self.write_waker.take() {
+            w.wake()
         }
+    }
+
+    unsafe fn read_ptr(&self) -> *mut u8 {
+        self.data.as_ref().as_ptr().add(self.read_offset) as *mut u8
+    }
+
+    unsafe fn write_ptr(&self) -> *mut u8 {
+        self.data.as_ref().as_ptr().add(self.write_offset) as *mut u8
     }
 }
 
@@ -102,6 +100,7 @@ mod tests {
     use futures::executor::block_on;
     use futures::future::join;
     use futures::io::{AsyncReadExt, AsyncWriteExt};
+    use std::time::Duration;
 
     #[test]
     fn it_works() {
@@ -159,5 +158,20 @@ mod tests {
             let n = reader.read(&mut buf).await.unwrap();
             assert_eq!(n, 0);
         });
+    }
+
+    #[tokio::test]
+    async fn do_not_overwrite() {
+        let (mut writer, mut reader) = ring_buffer(8);
+        tokio::task::spawn(async move {
+            for _ in 0..255 {
+                writer.write_all(&[0]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let mut buf = vec![];
+        reader.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(255, buf.len());
     }
 }
