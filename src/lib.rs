@@ -98,6 +98,7 @@ impl RingBuffer {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
     use super::*;
     use futures::executor::block_on;
     use futures::future::join;
@@ -159,5 +160,20 @@ mod tests {
             let n = reader.read(&mut buf).await.unwrap();
             assert_eq!(n, 0);
         });
+    }
+
+    #[tokio::test]
+    async fn do_not_overwrite() {
+        let (mut writer, mut reader) = ring_buffer(25);
+        tokio::task::spawn(async move {
+            for _ in 0..1000 {
+                writer.write_all(&[0]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        });
+
+        let mut buf = vec![];
+        reader.read_to_end(&mut buf).await.unwrap();
+        assert_eq!(1000, buf.len());
     }
 }
